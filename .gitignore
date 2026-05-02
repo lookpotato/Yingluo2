@@ -1,0 +1,14 @@
+# ESP-IDF build artifacts
+**/build/
+**/sdkconfig
+**/sdkconfig.old
+**/dependencies.lock
+**/*.map
+**/*.elf
+**/*.bin
+
+# IDE
+.vscode/
+
+# Python cache
+**/__pycache__/
