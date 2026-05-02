@@ -13,8 +13,10 @@ board_pins_t board_config_get_default(void)
 
         .gpio_servo_1 = 4,
         .gpio_servo_2 = 8,
+        .gpio_servo_3 = 5,
 
-        .gpio_led_group_a = 5,
+        /* GPIO5 已接第三路舵机；若 LED A 仍接在旧引脚请改此处 */
+        .gpio_led_group_a = 15,
         .gpio_led_group_b = 6,
     };
 

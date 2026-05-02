@@ -39,6 +39,7 @@ void servo_init(const board_pins_t *pins)
 
     servo_config_channel(LEDC_CHANNEL_0, pins->gpio_servo_1);
     servo_config_channel(LEDC_CHANNEL_1, pins->gpio_servo_2);
+    servo_config_channel(LEDC_CHANNEL_2, pins->gpio_servo_3);
 
     s_ready = true;
 }
@@ -56,7 +57,14 @@ void servo_set_angle(servo_id_t id, uint8_t angle)
     uint32_t max_duty = (1U << 14) - 1U;
     uint32_t pulse_us = SERVO_MIN_US + ((SERVO_MAX_US - SERVO_MIN_US) * angle) / 180U;
     uint32_t duty = (pulse_us * max_duty) / SERVO_PERIOD_US;
-    ledc_channel_t channel = (id == SERVO_1) ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1;
+    ledc_channel_t channel;
+    if (id == SERVO_1) {
+        channel = LEDC_CHANNEL_0;
+    } else if (id == SERVO_2) {
+        channel = LEDC_CHANNEL_1;
+    } else {
+        channel = LEDC_CHANNEL_2;
+    }
 
     ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);

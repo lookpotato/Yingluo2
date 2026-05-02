@@ -23,47 +23,40 @@ void app_main(void)
     led_group_init(&pins);
     servo_init(&pins);
 
-    int angle = 0;
-    servo_set_angle(SERVO_1, (uint8_t)angle);
+    int angle_s1 = 0;
+    int angle_s3 = 0;
+    servo_set_angle(SERVO_1, (uint8_t)angle_s1);
+    servo_set_angle(SERVO_3, (uint8_t)angle_s3);
 
-    /* 上电瞬间 I2C/XL9555 读数不可靠，易把输入全读成 0 → 误判 KEY1 一直按下，角度被连续加满 */
-    vTaskDelay(pdMS_TO_TICKS(300));
+    // 上电稳定一下
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    /* 连续约 250ms 读到 KEY1 松开(1)，才认为总线可信；否则先不武装，等真正松开 */
-    int key1_armed = 0;
-    {
-        int stable_ticks = 0;
-        for (int t = 0; t < 400; t++) {
-            if (KEY1 == 1) {
-                if (++stable_ticks >= 25) {
-                    key1_armed = 1;
-                    break;
-                }
-            } else {
-                stable_ticks = 0;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    /* KEY1 见 xl9555.h；按下为 0。每完整“按下再松开”只加 15° */
+    int last_key1 = 0;
+    int last_key0 = 0;
 
     while (1) {
-        if (KEY1 == 0) {
-            if (key1_armed) {
-                vTaskDelay(pdMS_TO_TICKS(25));
-                if (KEY1 == 0) {
-                    angle += 15;
-                    if (angle > 180) {
-                        angle = 180;
-                    }
-                    servo_set_angle(SERVO_1, (uint8_t)angle);
-                    key1_armed = 0;
-                }
+        int cur1 = KEY1;
+        if (last_key1 == 0 && cur1 == 1) {
+            angle_s1 += 15;
+            if (angle_s1 > 180) {
+                angle_s1 = 180;
             }
-        } else {
-            key1_armed = 1;
+            servo_set_angle(SERVO_1, (uint8_t)angle_s1);
+            printf("SERVO_1 angle = %d\n", angle_s1);
         }
+        last_key1 = cur1;
+
+        int cur0 = KEY0;
+        if (last_key0 == 0 && cur0 == 1) {
+            angle_s3 += 15;
+            if (angle_s3 > 180) {
+                angle_s3 = 180;
+            }
+            servo_set_angle(SERVO_3, (uint8_t)angle_s3);
+            printf("SERVO_3 (GPIO5) angle = %d\n", angle_s3);
+        }
+        last_key0 = cur0;
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

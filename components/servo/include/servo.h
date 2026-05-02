@@ -8,6 +8,7 @@
 typedef enum {
     SERVO_1 = 0,
     SERVO_2 = 1,
+    SERVO_3 = 2,
 } servo_id_t;
 
 void servo_init(const board_pins_t *pins);

@@ -14,6 +14,7 @@ typedef struct {
 
     int gpio_servo_1;
     int gpio_servo_2;
+    int gpio_servo_3;
 
     int gpio_led_group_a;
     int gpio_led_group_b;
