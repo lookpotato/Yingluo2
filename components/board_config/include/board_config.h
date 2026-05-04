@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 typedef struct {
+    int gpio_speaker_mclk;
     int gpio_speaker_bclk;
     int gpio_speaker_ws;
     int gpio_speaker_dout;

@@ -1,7 +1,9 @@
+#include <stdbool.h>
 #include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_err.h"
 
 #include "audio_io.h"
 #include "board_config.h"
@@ -15,11 +17,18 @@ void app_main(void)
     board_pins_t pins = board_config_get_default();
 
     printf("BanZiXueXi firmware start (ESP32-S3)\n");
+    printf("AUDIO_DBG board pins: MCLK=%d BCLK=%d WS=%d DOUT=%d\n",
+           pins.gpio_speaker_mclk, pins.gpio_speaker_bclk,
+           pins.gpio_speaker_ws, pins.gpio_speaker_dout);
+    printf("AUDIO_DBG controls: KEY2 toggles speaker test, SPK_EN_IO active level is low in current code\n");
 
     i2c_obj_t i2c = iic_init(I2C_NUM_0);
     xl9555_init(i2c);
 
-    audio_io_init(&pins);
+    esp_err_t audio_ret = audio_io_init(&pins, &i2c);
+    if (audio_ret != ESP_OK) {
+        printf("audio_io_init failed: %s\n", esp_err_to_name(audio_ret));
+    }
     led_group_init(&pins);
     servo_init(&pins);
 
@@ -33,6 +42,9 @@ void app_main(void)
 
     int last_key1 = 0;
     int last_key0 = 0;
+    int last_key2 = 1;
+    int last_key2_log = last_key2;
+    bool speaker_on = false;
 
     while (1) {
         int cur1 = KEY1;
@@ -56,6 +68,20 @@ void app_main(void)
             printf("SERVO_3 (GPIO5) angle = %d\n", angle_s3);
         }
         last_key0 = cur0;
+
+        /* KEY2：未按下为 1，按下为 0；在按下沿切换喇叭试音 */
+        int cur2 = KEY2;
+        if (cur2 != last_key2_log) {
+            printf("AUDIO_DBG KEY2 level changed: %d -> %d\n", last_key2_log, cur2);
+            last_key2_log = cur2;
+        }
+        if (last_key2 == 1 && cur2 == 0) {
+            speaker_on = !speaker_on;
+            printf("AUDIO_DBG KEY2 falling edge, speaker_on=%d\n", speaker_on);
+            audio_io_set_playing(speaker_on);
+            printf("扬声器试音 %s (audio ready=%d)\n", speaker_on ? "开" : "关", audio_io_is_ready());
+        }
+        last_key2 = cur2;
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }

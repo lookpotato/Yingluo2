@@ -1,25 +1,27 @@
 /**
  ****************************************************************************************************
-* @file        xl9555.c
-* @author      正点原子团队(ALIENTEK)
-* @version     V1.0
-* @date        2023-08-26
-* @brief       XL9555驱动代码
-* @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
-****************************************************************************************************
-* @attention
-*
-* 实验平台:正点原子 ESP32-S3 开发板
-* 在线视频:www.yuanzige.com
-* 技术论坛:www.openedv.com
-* 公司网址:www.alientek.com
-* 购买地址:openedv.taobao.com
-*
-****************************************************************************************************
-*/
+ * @file        xl9555.c
+ * @author      正点原子团队(ALIENTEK)
+ * @version     V1.0
+ * @date        2023-08-26
+ * @brief       XL9555驱动代码
+ * @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
+ ****************************************************************************************************
+ * @attention
+ *
+ * 实验平台:正点原子 ESP32-S3 开发板
+ * 在线视频:www.yuanzige.com
+ * 技术论坛:www.openedv.com
+ * 公司网址:www.alientek.com
+ * 购买地址:openedv.taobao.com
+ *
+ ****************************************************************************************************
+ */
 
 #include "xl9555.h"
 
+static const char *TAG = "xl9555";
+static uint16_t s_xl9555_output_shadow = 0xFFFF;
 
 i2c_obj_t xl9555_i2c_master;
 static uint16_t xl9555_failed = 0;
@@ -33,7 +35,7 @@ static uint16_t xl9555_failed = 0;
 esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 {
     uint8_t memaddr_buf[1];
-    memaddr_buf[0]  = XL9555_INPUT_PORT0_REG;
+    memaddr_buf[0] = XL9555_INPUT_PORT0_REG;
 
     i2c_buf_t bufs[2] = {
         {.len = 1, .buf = memaddr_buf},
@@ -68,39 +70,35 @@ esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
  */
 uint16_t xl9555_pin_write(uint16_t pin, int val)
 {
-    uint8_t w_data[2];
-    uint16_t temp = 0x0000;
-
-    xl9555_read_byte(w_data, 2);
-
-    if (pin <= GBC_KEY_IO)
+    if (val)
     {
-        if (val)
-        {
-            w_data[0] |= (uint8_t)(0xFF & pin);
-        }
-        else
-        {
-            w_data[0] &= ~(uint8_t)(0xFF & pin);
-        }
+        s_xl9555_output_shadow |= pin;
     }
     else
     {
-        if (val)
-        {
-            w_data[1] |= (uint8_t)(0xFF & (pin >> 8));
-        }
-        else
-        {
-            w_data[1] &= ~(uint8_t)(0xFF & (pin >> 8));
-        }
+        s_xl9555_output_shadow &= ~pin;
     }
 
-    temp = ((uint16_t)w_data[1] << 8) | w_data[0]; 
+    uint8_t w_data[2] = {
+        (uint8_t)(s_xl9555_output_shadow & 0xFF),
+        (uint8_t)((s_xl9555_output_shadow >> 8) & 0xFF),
+    };
 
-    xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, w_data, 2);
+    esp_err_t err = xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, w_data, 2);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "XL9555_DBG write failed pin=0x%04x val=%d out=0x%04x err=%s",
+                 pin, val, s_xl9555_output_shadow, esp_err_to_name(err));
+        return s_xl9555_output_shadow;
+    }
 
-    return temp;
+    if (pin == SPK_EN_IO)
+    {
+        ESP_LOGI(TAG, "XL9555_DBG SPK_EN write val=%d out_shadow=0x%04x",
+                 val, s_xl9555_output_shadow);
+    }
+
+    return s_xl9555_output_shadow;
 }
 
 /**
@@ -139,17 +137,17 @@ uint16_t xl9555_ioconfig(uint16_t config_value)
     do
     {
         err = xl9555_write_byte(XL9555_CONFIG_PORT0_REG, data, 2);
-        
+
         if (err != ESP_OK)
         {
             retry--;
-            vTaskDelay(100); 
+            vTaskDelay(100);
             ESP_LOGE("IIC", "%s configure %X failed, ret: %d", __func__, config_value, err);
             xl9555_failed = 1;
-            
+
             if ((retry <= 0) && xl9555_failed)
             {
-                vTaskDelay(5000); 
+                vTaskDelay(5000);
                 esp_restart();
             }
         }
@@ -158,9 +156,9 @@ uint16_t xl9555_ioconfig(uint16_t config_value)
             xl9555_failed = 0;
             break;
         }
-        
+
     } while (retry);
-    
+
     return config_value;
 }
 
@@ -173,27 +171,50 @@ void xl9555_init(i2c_obj_t self)
 {
     uint8_t r_data[2];
 
+    ESP_LOGI(TAG, "XL9555_DBG init begin self.init_flag=%d", self.init_flag);
     if (self.init_flag == ESP_FAIL)
     {
-        iic_init(I2C_NUM_0);        /* 初始化IIC */
+        ESP_LOGW(TAG, "XL9555_DBG input I2C init_flag is ESP_FAIL, reinitializing I2C_NUM_0");
+        iic_init(I2C_NUM_0); /* 初始化IIC */
     }
 
     xl9555_i2c_master = self;
     gpio_config_t gpio_init_struct = {0};
-    
+
     gpio_init_struct.intr_type = GPIO_INTR_DISABLE;
     gpio_init_struct.mode = GPIO_MODE_INPUT;
     gpio_init_struct.pin_bit_mask = (1ull << XL9555_INT_IO);
     gpio_init_struct.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_init_struct.pull_up_en = GPIO_PULLUP_ENABLE;
-    gpio_config(&gpio_init_struct);     /* 配置XL_INT引脚 */
+    gpio_config(&gpio_init_struct); /* 配置XL_INT引脚 */
 
     /* 上电先读取一次清除中断标志 */
-    xl9555_read_byte(r_data, 2);
-    
-    xl9555_ioconfig(0xF003);
-    xl9555_pin_write(BEEP_IO, 1);
-    xl9555_pin_write(SPK_EN_IO, 1);
+    esp_err_t err = xl9555_read_byte(r_data, 2);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "XL9555_DBG initial input=0x%04x", ((uint16_t)r_data[1] << 8) | r_data[0]);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "XL9555_DBG initial read failed: %s", esp_err_to_name(err));
+    }
+
+    s_xl9555_output_shadow = 0xFFFF;
+
+    /* 先写输出默认值 */
+    uint8_t out_data[2] = {
+        (uint8_t)(s_xl9555_output_shadow & 0xFF),
+        (uint8_t)((s_xl9555_output_shadow >> 8) & 0xFF),
+    };
+    xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, out_data, 2);
+
+    /* 再配置方向 */
+    uint16_t cfg = xl9555_ioconfig(0xF003);
+    ESP_LOGI(TAG, "XL9555_DBG config=0x%04x", cfg);
+    uint16_t beep_state = xl9555_pin_write(BEEP_IO, 1);
+    ESP_LOGI(TAG, "XL9555_DBG BEEP_IO default high out_latch=0x%04x", beep_state);
+    uint16_t spk_state = xl9555_pin_write(SPK_EN_IO, 1);
+    ESP_LOGI(TAG, "XL9555_DBG SPK_EN_IO default high/off out_latch=0x%04x", spk_state);
 }
 
 /**
@@ -208,16 +229,16 @@ void xl9555_init(i2c_obj_t self)
 uint8_t xl9555_key_scan(uint8_t mode)
 {
     uint8_t keyval = 0;
-    static uint8_t key_up = 1;                                          /* 按键按松开标志 */
+    static uint8_t key_up = 1; /* 按键按松开标志 */
 
     if (mode)
     {
-        key_up = 1;                                                     /* 支持连按 */
+        key_up = 1; /* 支持连按 */
     }
-    
-    if (key_up && (KEY0 == 0 || KEY1 == 0 || KEY2 == 0  || KEY3 == 0 )) /* 按键松开标志为1, 且有任意一个按键按下了 */
+
+    if (key_up && (KEY0 == 0 || KEY1 == 0 || KEY2 == 0 || KEY3 == 0)) /* 按键松开标志为1, 且有任意一个按键按下了 */
     {
-        vTaskDelay(10);                                                 /* 去抖动 */
+        vTaskDelay(10); /* 去抖动 */
         key_up = 0;
 
         if (KEY0 == 0)
@@ -240,10 +261,10 @@ uint8_t xl9555_key_scan(uint8_t mode)
             keyval = KEY3_PRES;
         }
     }
-    else if (KEY0 == 1 && KEY1 == 1 && KEY2 == 1 && KEY3 == 1)          /* 没有任何按键按下, 标记按键松开 */
+    else if (KEY0 == 1 && KEY1 == 1 && KEY2 == 1 && KEY3 == 1) /* 没有任何按键按下, 标记按键松开 */
     {
         key_up = 1;
     }
 
-    return keyval;                                                      /* 返回键值 */
+    return keyval; /* 返回键值 */
 }
