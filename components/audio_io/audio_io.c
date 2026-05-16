@@ -6,6 +6,7 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "es8388_hw.h"
@@ -14,6 +15,7 @@
 static const char *TAG = "audio_io";
 
 #define AUDIO_SAMPLE_RATE_HZ 44100
+#define MIC_SAMPLE_RATE_HZ   16000
 #define VOICE_BASE_HZ        125
 #define VOICE_AMPLITUDE      15000
 #define VOICE_CLIP_FRAMES    (AUDIO_SAMPLE_RATE_HZ * 6 / 5)
@@ -22,9 +24,14 @@ static const char *TAG = "audio_io";
 
 static i2c_obj_t *s_i2c;
 static i2s_chan_handle_t s_tx;
+static i2s_chan_handle_t s_rx;
+static SemaphoreHandle_t s_tx_mutex;
 static volatile bool s_playing;
 static volatile bool s_ready;
+static volatile bool s_mic_ready;
 static volatile uint32_t s_play_cmd_count;
+static bool s_stream_old_playing;
+static bool s_stream_active;
 
 static int32_t voice_envelope_q15(uint32_t clip_frame)
 {
@@ -143,8 +150,13 @@ static void audio_task(void *arg)
             sample_index = 0;
         }
 
+        if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            continue;
+        }
+
         size_t written = 0;
         esp_err_t e = i2s_channel_write(s_tx, buf, sizeof(buf), &written, portMAX_DELAY);
+        xSemaphoreGive(s_tx_mutex);
         if (e != ESP_OK) {
             ESP_LOGW(TAG, "AUDIO_DBG i2s_channel_write err=%s play=%d requested=%d written=%u",
                      esp_err_to_name(e), play, (int)sizeof(buf), (unsigned)written);
@@ -176,6 +188,9 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
     ESP_LOGI(TAG, "AUDIO_DBG board pins: MCLK=%d BCLK=%d WS=%d DOUT=%d",
              pins->gpio_speaker_mclk, pins->gpio_speaker_bclk,
              pins->gpio_speaker_ws, pins->gpio_speaker_dout);
+    ESP_LOGI(TAG, "AUDIO_DBG mic pins: BCLK=%d WS=%d DIN=%d sample_rate=%d",
+             pins->gpio_mic_bclk, pins->gpio_mic_ws, pins->gpio_mic_din,
+             MIC_SAMPLE_RATE_HZ);
     ESP_LOGI(TAG, "AUDIO_DBG format: sample_rate=%d bits=16 channels=2 voice_base=%dHz amplitude=%d clip_ms=%d",
              AUDIO_SAMPLE_RATE_HZ, VOICE_BASE_HZ, VOICE_AMPLITUDE,
              (VOICE_CLIP_FRAMES * 1000) / AUDIO_SAMPLE_RATE_HZ);
@@ -188,6 +203,12 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         return err;
     }
     ESP_LOGI(TAG, "AUDIO_DBG ES8388 init OK, addr=0x%02x", es8388_hw_get_addr());
+
+    s_tx_mutex = xSemaphoreCreateMutex();
+    if (s_tx_mutex == NULL) {
+        ESP_LOGE(TAG, "Create tx mutex failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_LOGI(TAG, "AUDIO_DBG creating I2S channel: port=I2S_NUM_0 role=master");
@@ -234,6 +255,52 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         return err;
     }
     ESP_LOGI(TAG, "AUDIO_DBG i2s_channel_enable OK");
+
+    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    ESP_LOGI(TAG, "AUDIO_DBG creating mic I2S channel: port=I2S_NUM_1 role=master");
+    err = i2s_new_channel(&rx_chan_cfg, NULL, &s_rx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mic i2s_new_channel: %s", esp_err_to_name(err));
+        s_mic_ready = false;
+    } else {
+        i2s_std_config_t rx_std_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE_HZ),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                            I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = (gpio_num_t)pins->gpio_mic_bclk,
+                .ws = (gpio_num_t)pins->gpio_mic_ws,
+                .dout = I2S_GPIO_UNUSED,
+                .din = (gpio_num_t)pins->gpio_mic_din,
+                .invert_flags = {
+                    .mclk_inv = false,
+                    .bclk_inv = false,
+                    .ws_inv = false,
+                },
+            },
+        };
+
+        err = i2s_channel_init_std_mode(s_rx, &rx_std_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "mic i2s_channel_init_std_mode: %s", esp_err_to_name(err));
+            i2s_del_channel(s_rx);
+            s_rx = NULL;
+            s_mic_ready = false;
+        } else {
+            err = i2s_channel_enable(s_rx);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "mic i2s_channel_enable: %s", esp_err_to_name(err));
+                i2s_del_channel(s_rx);
+                s_rx = NULL;
+                s_mic_ready = false;
+            } else {
+                s_mic_ready = true;
+                ESP_LOGI(TAG, "Mic ready: I2S_NUM_1 BCLK=%d WS=%d DIN=%d 16kHz/16-bit/mono",
+                         pins->gpio_mic_bclk, pins->gpio_mic_ws, pins->gpio_mic_din);
+            }
+        }
+    }
 
     s_playing = false;
     if (s_i2c) {
@@ -294,4 +361,149 @@ void audio_io_set_playing(bool play)
 bool audio_io_is_ready(void)
 {
     return s_ready;
+}
+
+bool audio_io_mic_is_ready(void)
+{
+    return s_mic_ready;
+}
+
+esp_err_t audio_io_read_mic_mono16(int16_t *samples, size_t sample_count,
+                                   size_t *samples_read, TickType_t timeout_ticks)
+{
+    if (!samples || sample_count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_rx || !s_mic_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(s_rx, samples, sample_count * sizeof(int16_t),
+                                     &bytes_read, timeout_ticks);
+    if (samples_read) {
+        *samples_read = bytes_read / sizeof(int16_t);
+    }
+    return err;
+}
+
+esp_err_t audio_io_playback_begin(void)
+{
+    if (!s_tx || !s_ready || !s_tx_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_stream_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_stream_old_playing = s_playing;
+    s_playing = false;
+
+    uint16_t io_state = xl9555_pin_write(SPK_EN_IO, 0);
+    ESP_LOGI(TAG, "PCM stream playback start: SPK_EN state=0x%04x", io_state);
+    if (s_i2c) {
+        es8388_hw_mute(s_i2c, false);
+    }
+
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        if (s_i2c) {
+            es8388_hw_mute(s_i2c, !s_stream_old_playing);
+        }
+        if (!s_stream_old_playing) {
+            xl9555_pin_write(SPK_EN_IO, 1);
+        }
+        s_playing = s_stream_old_playing;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_stream_active = true;
+    return ESP_OK;
+}
+
+esp_err_t audio_io_playback_write_pcm(const int16_t *pcm, size_t frame_count,
+                                      int sample_rate_hz, int channel_count)
+{
+    if (!pcm || frame_count == 0 || sample_rate_hz <= 0 ||
+        (channel_count != 1 && channel_count != 2)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_stream_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int16_t out[FRAMES_PER_WRITE * 2];
+    uint64_t out_frames_total = ((uint64_t)frame_count * AUDIO_SAMPLE_RATE_HZ) /
+                                (uint32_t)sample_rate_hz;
+    if (out_frames_total == 0) {
+        out_frames_total = 1;
+    }
+
+    esp_err_t ret = ESP_OK;
+    uint64_t out_pos = 0;
+    while (out_pos < out_frames_total) {
+        size_t todo = (size_t)(out_frames_total - out_pos);
+        if (todo > FRAMES_PER_WRITE) {
+            todo = FRAMES_PER_WRITE;
+        }
+
+        for (size_t i = 0; i < todo; i++) {
+            uint64_t src_frame = ((out_pos + i) * (uint32_t)sample_rate_hz) /
+                                 AUDIO_SAMPLE_RATE_HZ;
+            if (src_frame >= frame_count) {
+                src_frame = frame_count - 1;
+            }
+
+            int32_t mono;
+            if (channel_count == 1) {
+                mono = pcm[src_frame];
+            } else {
+                mono = ((int32_t)pcm[src_frame * 2] + (int32_t)pcm[src_frame * 2 + 1]) / 2;
+            }
+            out[i * 2] = (int16_t)mono;
+            out[i * 2 + 1] = (int16_t)mono;
+        }
+
+        size_t written = 0;
+        ret = i2s_channel_write(s_tx, out, todo * 2 * sizeof(int16_t),
+                                &written, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "PCM playback write failed: %s", esp_err_to_name(ret));
+            break;
+        }
+        out_pos += todo;
+    }
+
+    return ret;
+}
+
+void audio_io_playback_end(void)
+{
+    if (!s_stream_active) {
+        return;
+    }
+
+    s_stream_active = false;
+    xSemaphoreGive(s_tx_mutex);
+
+    if (s_i2c) {
+        es8388_hw_mute(s_i2c, !s_stream_old_playing);
+    }
+    if (!s_stream_old_playing) {
+        xl9555_pin_write(SPK_EN_IO, 1);
+    }
+    s_playing = s_stream_old_playing;
+    ESP_LOGI(TAG, "PCM stream playback done");
+}
+
+esp_err_t audio_io_play_pcm(const int16_t *pcm, size_t frame_count,
+                            int sample_rate_hz, int channel_count)
+{
+    esp_err_t ret = audio_io_playback_begin();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = audio_io_playback_write_pcm(pcm, frame_count, sample_rate_hz, channel_count);
+    audio_io_playback_end();
+    ESP_LOGI(TAG, "PCM playback done: %s", esp_err_to_name(ret));
+    return ret;
 }
