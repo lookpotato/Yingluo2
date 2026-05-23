@@ -14,7 +14,7 @@
 
 static const char *TAG = "audio_io";
 
-#define AUDIO_SAMPLE_RATE_HZ 44100
+#define AUDIO_SAMPLE_RATE_HZ 16000
 #define MIC_SAMPLE_RATE_HZ   16000
 #define VOICE_BASE_HZ        125
 #define VOICE_AMPLITUDE      15000
@@ -194,7 +194,7 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
     ESP_LOGI(TAG, "AUDIO_DBG format: sample_rate=%d bits=16 channels=2 voice_base=%dHz amplitude=%d clip_ms=%d",
              AUDIO_SAMPLE_RATE_HZ, VOICE_BASE_HZ, VOICE_AMPLITUDE,
              (VOICE_CLIP_FRAMES * 1000) / AUDIO_SAMPLE_RATE_HZ);
-    ESP_LOGI(TAG, "Preparing speaker path: ES8388 + I2S 44.1kHz/16-bit/stereo");
+    ESP_LOGI(TAG, "Preparing ES8388 path: I2S 16kHz/16-bit/stereo TX+RX");
 
     esp_err_t err = es8388_hw_init_for_speaker(i2c);
     if (err != ESP_OK) {
@@ -211,8 +211,8 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
     }
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    ESP_LOGI(TAG, "AUDIO_DBG creating I2S channel: port=I2S_NUM_0 role=master");
-    err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
+    ESP_LOGI(TAG, "AUDIO_DBG creating I2S channels: port=I2S_NUM_0 role=master");
+    err = i2s_new_channel(&chan_cfg, &s_tx, &s_rx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel: %s", esp_err_to_name(err));
         return err;
@@ -227,7 +227,7 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
             .bclk = (gpio_num_t)pins->gpio_speaker_bclk,
             .ws = (gpio_num_t)pins->gpio_speaker_ws,
             .dout = (gpio_num_t)pins->gpio_speaker_dout,
-            .din = I2S_GPIO_UNUSED,
+            .din = (gpio_num_t)pins->gpio_mic_din,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -244,7 +244,7 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         s_ready = false;
         return err;
     }
-    ESP_LOGI(TAG, "AUDIO_DBG i2s_channel_init_std_mode OK");
+    ESP_LOGI(TAG, "AUDIO_DBG tx i2s_channel_init_std_mode OK");
 
     err = i2s_channel_enable(s_tx);
     if (err != ESP_OK) {
@@ -255,52 +255,35 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         return err;
     }
     ESP_LOGI(TAG, "AUDIO_DBG i2s_channel_enable OK");
-
-    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    ESP_LOGI(TAG, "AUDIO_DBG creating mic I2S channel: port=I2S_NUM_1 role=master");
-    err = i2s_new_channel(&rx_chan_cfg, NULL, &s_rx);
+    err = i2s_channel_init_std_mode(s_rx, &std_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mic i2s_new_channel: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "mic i2s_channel_init_std_mode: %s", esp_err_to_name(err));
+        i2s_channel_disable(s_tx);
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
+        i2s_del_channel(s_rx);
+        s_rx = NULL;
+        s_ready = false;
         s_mic_ready = false;
-    } else {
-        i2s_std_config_t rx_std_cfg = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE_HZ),
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                            I2S_SLOT_MODE_MONO),
-            .gpio_cfg = {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = (gpio_num_t)pins->gpio_mic_bclk,
-                .ws = (gpio_num_t)pins->gpio_mic_ws,
-                .dout = I2S_GPIO_UNUSED,
-                .din = (gpio_num_t)pins->gpio_mic_din,
-                .invert_flags = {
-                    .mclk_inv = false,
-                    .bclk_inv = false,
-                    .ws_inv = false,
-                },
-            },
-        };
-
-        err = i2s_channel_init_std_mode(s_rx, &rx_std_cfg);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "mic i2s_channel_init_std_mode: %s", esp_err_to_name(err));
-            i2s_del_channel(s_rx);
-            s_rx = NULL;
-            s_mic_ready = false;
-        } else {
-            err = i2s_channel_enable(s_rx);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "mic i2s_channel_enable: %s", esp_err_to_name(err));
-                i2s_del_channel(s_rx);
-                s_rx = NULL;
-                s_mic_ready = false;
-            } else {
-                s_mic_ready = true;
-                ESP_LOGI(TAG, "Mic ready: I2S_NUM_1 BCLK=%d WS=%d DIN=%d 16kHz/16-bit/mono",
-                         pins->gpio_mic_bclk, pins->gpio_mic_ws, pins->gpio_mic_din);
-            }
-        }
+        return err;
     }
+
+    err = i2s_channel_enable(s_rx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mic i2s_channel_enable: %s", esp_err_to_name(err));
+        i2s_channel_disable(s_tx);
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
+        i2s_del_channel(s_rx);
+        s_rx = NULL;
+        s_ready = false;
+        s_mic_ready = false;
+        return err;
+    }
+    s_mic_ready = true;
+    ESP_LOGI(TAG, "Mic ready: I2S_NUM_0 MCLK=%d BCLK=%d WS=%d DOUT=%d DIN=%d 16kHz/16-bit/stereo slots",
+             pins->gpio_speaker_mclk, pins->gpio_speaker_bclk, pins->gpio_speaker_ws,
+             pins->gpio_speaker_dout, pins->gpio_mic_din);
 
     s_playing = false;
     if (s_i2c) {
@@ -368,6 +351,39 @@ bool audio_io_mic_is_ready(void)
     return s_mic_ready;
 }
 
+esp_err_t mic_init(void)
+{
+    static i2c_obj_t mic_i2c;
+    static bool initialized;
+
+    if (initialized) {
+        return ESP_OK;
+    }
+
+    board_pins_t pins = board_config_get_default();
+    mic_i2c = iic_init(I2C_NUM_0);
+    esp_err_t err = audio_io_init(&pins, &mic_i2c);
+    if (err == ESP_OK) {
+        initialized = true;
+    }
+    return err;
+}
+
+size_t mic_read_pcm(uint8_t *buf, size_t len)
+{
+    if (!buf || len < sizeof(int16_t)) {
+        return 0;
+    }
+
+    size_t samples_read = 0;
+    esp_err_t err = audio_io_read_mic_mono16((int16_t *)buf, len / sizeof(int16_t),
+                                             &samples_read, portMAX_DELAY);
+    if (err != ESP_OK) {
+        return 0;
+    }
+    return samples_read * sizeof(int16_t);
+}
+
 esp_err_t audio_io_read_mic_mono16(int16_t *samples, size_t sample_count,
                                    size_t *samples_read, TickType_t timeout_ticks)
 {
@@ -378,11 +394,36 @@ esp_err_t audio_io_read_mic_mono16(int16_t *samples, size_t sample_count,
         return ESP_ERR_INVALID_STATE;
     }
 
-    size_t bytes_read = 0;
-    esp_err_t err = i2s_channel_read(s_rx, samples, sample_count * sizeof(int16_t),
-                                     &bytes_read, timeout_ticks);
+    size_t total_samples = 0;
+    esp_err_t err = ESP_OK;
+    int16_t stereo[FRAMES_PER_WRITE * 2];
+
+    while (total_samples < sample_count) {
+        size_t frames = sample_count - total_samples;
+        if (frames > FRAMES_PER_WRITE) {
+            frames = FRAMES_PER_WRITE;
+        }
+
+        size_t bytes_read = 0;
+        err = i2s_channel_read(s_rx, stereo, frames * 2 * sizeof(int16_t),
+                               &bytes_read, timeout_ticks);
+        if (err != ESP_OK) {
+            break;
+        }
+
+        size_t frames_read = bytes_read / (2 * sizeof(int16_t));
+        for (size_t i = 0; i < frames_read; i++) {
+            samples[total_samples + i] = stereo[i * 2];
+        }
+        total_samples += frames_read;
+
+        if (frames_read == 0 || frames_read < frames) {
+            break;
+        }
+    }
+
     if (samples_read) {
-        *samples_read = bytes_read / sizeof(int16_t);
+        *samples_read = total_samples;
     }
     return err;
 }

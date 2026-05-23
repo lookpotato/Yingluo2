@@ -116,7 +116,7 @@ esp_err_t ws2812b_refresh(void)
     ESP_RETURN_ON_ERROR(rmt_tx_wait_all_done(s_tx_channel, -1), TAG, "wait RMT TX done failed");
 
     esp_rom_delay_us(WS2812B_RESET_US);
-    ESP_LOGI(TAG, "refresh ok: sent %lu LED(s), %lu byte(s), reset=%dus",
+    ESP_LOGD(TAG, "refresh ok: sent %lu LED(s), %lu byte(s), reset=%dus",
              s_led_count, s_led_count * WS2812B_BYTES_PER_LED, WS2812B_RESET_US);
     return ESP_OK;
 }

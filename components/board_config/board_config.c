@@ -9,9 +9,9 @@ board_pins_t board_config_get_default(void)
         .gpio_speaker_ws = 9,
         .gpio_speaker_dout = 10,
 
-        .gpio_mic_bclk = 47,
-        .gpio_mic_ws = 48,
-        .gpio_mic_din = 39,
+        .gpio_mic_bclk = 46,
+        .gpio_mic_ws = 9,
+        .gpio_mic_din = 14,
 
         .gpio_servo_1 = 4,
         .gpio_servo_2 = 8,

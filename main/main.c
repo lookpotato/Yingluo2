@@ -35,9 +35,10 @@
 #define VOICE_CHAT_URL VOICE_SERVER_BASE_URL "/api/voice/chat"
 #define VOICE_DEVICE_ID "esp32s3-001"
 #define VOICE_SAMPLE_RATE_HZ 16000
-#define VOICE_MAX_RECORD_MS 30000
+#define VOICE_MAX_RECORD_MS 8000
 #define VOICE_RECORD_CHUNK_SAMPLES 512
 #define VOICE_HTTP_TIMEOUT_MS 90000
+#define VOICE_MIN_RECORD_MS 1000
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -48,6 +49,55 @@
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
+
+static void voice_debug_dump_bytes(const char *label, const uint8_t *data, size_t len)
+{
+    size_t dump_len = len < 16 ? len : 16;
+
+    printf("VOICE_DBG: %s len=%u first%u=", label, (unsigned)len, (unsigned)dump_len);
+    for (size_t i = 0; i < dump_len; i++) {
+        printf("%02x", data[i]);
+        if (i + 1 < dump_len) {
+            printf(" ");
+        }
+    }
+    printf("\n");
+}
+
+static void voice_debug_pcm_stats(const int16_t *samples, size_t sample_count,
+                                  size_t total_samples)
+{
+    if (!samples || sample_count == 0) {
+        return;
+    }
+
+    int16_t min_sample = samples[0];
+    int16_t max_sample = samples[0];
+    uint64_t abs_sum = 0;
+    for (size_t i = 0; i < sample_count; i++) {
+        int16_t sample = samples[i];
+        int32_t abs_sample = sample < 0 ? -(int32_t)sample : sample;
+        if (sample < min_sample) {
+            min_sample = sample;
+        }
+        if (sample > max_sample) {
+            max_sample = sample;
+        }
+        abs_sum += (uint32_t)abs_sample;
+    }
+
+    size_t print_count = sample_count < 8 ? sample_count : 8;
+    printf("VOICE_DBG: mic chunk total_samples=%u chunk=%u min=%d max=%d avg_abs=%u first%u=",
+           (unsigned)total_samples, (unsigned)sample_count, min_sample, max_sample,
+           (unsigned)(abs_sum / sample_count), (unsigned)print_count);
+    for (size_t i = 0; i < print_count; i++) {
+        printf("%d", samples[i]);
+        if (i + 1 < print_count) {
+            printf(",");
+        }
+    }
+    printf("\n");
+}
 
 static void wav_write_u16_le(uint8_t *p, uint16_t v)
 {
@@ -79,19 +129,45 @@ static void wav_write_header(uint8_t *wav, uint32_t pcm_bytes)
     wav_write_u32_le(wav + 40, pcm_bytes);
 }
 
+static uint8_t *voice_alloc_wav_buffer(size_t *max_samples_out)
+{
+    size_t max_samples = (VOICE_SAMPLE_RATE_HZ * VOICE_MAX_RECORD_MS) / 1000;
+    const size_t min_samples = (VOICE_SAMPLE_RATE_HZ * VOICE_MIN_RECORD_MS) / 1000;
+
+    while (max_samples >= min_samples) {
+        size_t bytes = 44 + max_samples * sizeof(int16_t);
+        uint8_t *wav = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!wav) {
+            wav = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+        }
+        if (wav) {
+            *max_samples_out = max_samples;
+            return wav;
+        }
+
+        printf("VOICE: allocate wav buffer failed (%u bytes), largest 8bit=%u psram=%u\n",
+               (unsigned)bytes,
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        max_samples /= 2;
+    }
+
+    return NULL;
+}
+
 static uint8_t *voice_record_wav_until_stop(size_t *wav_len)
 {
-    const size_t max_samples = (VOICE_SAMPLE_RATE_HZ * VOICE_MAX_RECORD_MS) / 1000;
-    int16_t *pcm = heap_caps_malloc(max_samples * sizeof(int16_t), MALLOC_CAP_8BIT);
-    if (!pcm) {
-        printf("VOICE: allocate pcm buffer failed (%u bytes)\n",
-               (unsigned)(max_samples * sizeof(int16_t)));
+    size_t max_samples = 0;
+    uint8_t *wav = voice_alloc_wav_buffer(&max_samples);
+    if (!wav) {
+        printf("VOICE: allocate wav buffer failed; cannot record\n");
         return NULL;
     }
 
     printf("VOICE: recording started, press KEY2 to stop and upload, max=%d ms\n",
-           VOICE_MAX_RECORD_MS);
+           (int)((max_samples * 1000) / VOICE_SAMPLE_RATE_HZ));
     size_t sample_count = 0;
+    size_t last_debug_sample_count = 0;
     int last_stop = KEY2;
     TickType_t start = xTaskGetTickCount();
 
@@ -102,6 +178,7 @@ static uint8_t *voice_record_wav_until_stop(size_t *wav_len)
             room = VOICE_RECORD_CHUNK_SAMPLES;
         }
 
+        int16_t *pcm = (int16_t *)(wav + 44);
         esp_err_t err = audio_io_read_mic_mono16(&pcm[sample_count], room, &got,
                                                  pdMS_TO_TICKS(1000));
         if (err != ESP_OK) {
@@ -109,6 +186,10 @@ static uint8_t *voice_record_wav_until_stop(size_t *wav_len)
             break;
         }
         sample_count += got;
+        if (got > 0 && sample_count - last_debug_sample_count >= VOICE_SAMPLE_RATE_HZ) {
+            voice_debug_pcm_stats(&pcm[sample_count - got], got, sample_count);
+            last_debug_sample_count = sample_count;
+        }
 
         int cur_stop = KEY2;
         if (last_stop == 1 && cur_stop == 0) {
@@ -124,22 +205,23 @@ static uint8_t *voice_record_wav_until_stop(size_t *wav_len)
 
     if (sample_count < VOICE_SAMPLE_RATE_HZ / 5) {
         printf("VOICE: recording too short, skip upload\n");
-        free(pcm);
+        free(wav);
         return NULL;
     }
 
     size_t total_len = 44 + sample_count * sizeof(int16_t);
-    uint8_t *wav = heap_caps_malloc(total_len, MALLOC_CAP_8BIT);
-    if (!wav) {
-        printf("VOICE: allocate wav buffer failed (%u bytes)\n", (unsigned)total_len);
-        free(pcm);
-        return NULL;
-    }
-
+    int16_t *pcm = (int16_t *)(wav + 44);
     wav_write_header(wav, (uint32_t)(sample_count * sizeof(int16_t)));
-    memcpy(wav + 44, pcm, sample_count * sizeof(int16_t));
-    free(pcm);
+    voice_debug_pcm_stats(pcm, sample_count < VOICE_SAMPLE_RATE_HZ ? sample_count : VOICE_SAMPLE_RATE_HZ,
+                          sample_count);
     *wav_len = total_len;
+    printf("VOICE_DBG: wav built bytes=%u pcm_bytes=%u sample_rate=%d bits=16 channels=1\n",
+           (unsigned)total_len, (unsigned)(sample_count * sizeof(int16_t)),
+           VOICE_SAMPLE_RATE_HZ);
+    voice_debug_dump_bytes("wav header", wav, total_len < 44 ? total_len : 44);
+    if (total_len > 44) {
+        voice_debug_dump_bytes("wav pcm data", wav + 44, total_len - 44);
+    }
     return wav;
 }
 
@@ -218,6 +300,9 @@ static char *voice_upload_wav(const uint8_t *wav, size_t wav_len)
     esp_http_client_set_header(client, "Content-Type", content_type);
 
     int content_len = head_len + (int)wav_len + tail_len;
+    printf("VOICE_DBG: upload multipart head=%d wav=%u tail=%d total=%d url=%s\n",
+           head_len, (unsigned)wav_len, tail_len, content_len, VOICE_CHAT_URL);
+    voice_debug_dump_bytes("upload wav", wav, wav_len);
     esp_err_t err = esp_http_client_open(client, content_len);
     if (err != ESP_OK) {
         printf("VOICE: POST open failed: %s\n", esp_err_to_name(err));
@@ -243,6 +328,9 @@ static char *voice_upload_wav(const uint8_t *wav, size_t wav_len)
     int status = esp_http_client_get_status_code(client);
     printf("VOICE: POST status=%d content_len=%d\n", status, fetch_len);
     char *response = http_read_text_response(client, 4096);
+    if (response) {
+        printf("VOICE_DBG: POST response bytes=%u\n", (unsigned)strlen(response));
+    }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
@@ -355,11 +443,14 @@ static uint8_t *http_download_binary(const char *url, size_t *out_len)
             break;
         }
         total += ret;
+        printf("VOICE_DBG: GET read chunk=%d total=%u cap=%u\n",
+               ret, (unsigned)total, (unsigned)cap);
     }
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     *out_len = total;
+    voice_debug_dump_bytes("download body", buf, total);
     return buf;
 }
 
@@ -367,6 +458,9 @@ static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
 {
     mp3dec_t dec;
     mp3dec_init(&dec);
+    voice_debug_dump_bytes("mp3 input", mp3, mp3_len);
+    printf("VOICE_DBG: mp3 playback stack free before=%u\n",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     esp_err_t stream_err = audio_io_playback_begin();
     if (stream_err != ESP_OK) {
@@ -374,11 +468,20 @@ static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
         return;
     }
 
+    int16_t *pcm = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
+                                    MALLOC_CAP_8BIT);
+    if (!pcm) {
+        printf("VOICE: allocate mp3 pcm buffer failed (%u bytes), largest 8bit=%u\n",
+               (unsigned)(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        audio_io_playback_end();
+        return;
+    }
+
     size_t offset = 0;
     int frame_index = 0;
     while (offset < mp3_len) {
         mp3dec_frame_info_t info = {0};
-        int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
         int samples = mp3dec_decode_frame(&dec, mp3 + offset, (int)(mp3_len - offset),
                                           pcm, &info);
         if (info.frame_bytes == 0) {
@@ -387,6 +490,12 @@ static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
         }
         offset += info.frame_bytes;
         if (samples > 0 && info.hz > 0 && info.channels > 0) {
+            if (frame_index == 0) {
+                printf("VOICE_DBG: mp3 first frame bytes=%d samples=%d hz=%d channels=%d layer=%d bitrate=%d\n",
+                       info.frame_bytes, samples, info.hz, info.channels,
+                       info.layer, info.bitrate_kbps);
+                voice_debug_pcm_stats(pcm, (size_t)samples, (size_t)samples);
+            }
             esp_err_t err = audio_io_playback_write_pcm(pcm, (size_t)samples,
                                                         info.hz, info.channels);
             if (err != ESP_OK) {
@@ -397,7 +506,10 @@ static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
             frame_index++;
         }
     }
+    free(pcm);
     audio_io_playback_end();
+    printf("VOICE_DBG: mp3 playback stack free after=%u\n",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
     printf("VOICE: mp3 playback frames=%d bytes=%u\n", frame_index, (unsigned)mp3_len);
 }
 
@@ -463,8 +575,6 @@ static void voice_chat_once(void)
 
 static void ws2812b_gpio_probe(gpio_num_t gpio_num)
 {
-    printf("WS2812B_PROBE start: temporarily testing GPIO%d pad level\n", gpio_num);
-
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << gpio_num,
         .mode = GPIO_MODE_INPUT,
@@ -473,49 +583,26 @@ static void ws2812b_gpio_probe(gpio_num_t gpio_num)
         .intr_type = GPIO_INTR_DISABLE,
     };
     esp_err_t ret = gpio_config(&io_conf);
-    printf("WS2812B_PROBE input pull-up config(GPIO%d) = %s\n", gpio_num, esp_err_to_name(ret));
     vTaskDelay(pdMS_TO_TICKS(100));
-    printf("WS2812B_PROBE GPIO%d input with internal pull-up, readback=%d\n",
-           gpio_num, gpio_get_level(gpio_num));
 
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
     ret = gpio_config(&io_conf);
-    printf("WS2812B_PROBE input pull-down config(GPIO%d) = %s\n", gpio_num, esp_err_to_name(ret));
     vTaskDelay(pdMS_TO_TICKS(100));
-    printf("WS2812B_PROBE GPIO%d input with internal pull-down, readback=%d\n",
-           gpio_num, gpio_get_level(gpio_num));
 
     io_conf.mode = GPIO_MODE_INPUT_OUTPUT;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     ret = gpio_config(&io_conf);
-    printf("WS2812B_PROBE input/output config(GPIO%d) = %s\n", gpio_num, esp_err_to_name(ret));
     if (ret != ESP_OK) {
         return;
     }
 
-    ret = gpio_set_level(gpio_num, 1);
+    gpio_set_level(gpio_num, 1);
     vTaskDelay(pdMS_TO_TICKS(300));
-    int high_level = gpio_get_level(gpio_num);
-    printf("WS2812B_PROBE GPIO%d forced HIGH ret=%s, readback=%d\n",
-           gpio_num, esp_err_to_name(ret), high_level);
 
-    ret = gpio_set_level(gpio_num, 0);
+    gpio_set_level(gpio_num, 0);
     vTaskDelay(pdMS_TO_TICKS(300));
-    int low_level = gpio_get_level(gpio_num);
-    printf("WS2812B_PROBE GPIO%d forced LOW ret=%s, readback=%d\n",
-           gpio_num, esp_err_to_name(ret), low_level);
-
-    if (high_level != 1) {
-        printf("WS2812B_PROBE WARNING: GPIO%d did not read HIGH. Disconnect WS2812B DIN from GPIO%d and reboot to test whether the external wire/light is pulling it low.\n",
-               gpio_num, gpio_num);
-    } else if (low_level != 0) {
-        printf("WS2812B_PROBE WARNING: GPIO%d did not read LOW. Check whether it is pulled high externally.\n",
-               gpio_num);
-    } else {
-        printf("WS2812B_PROBE GPIO%d basic output test passed.\n", gpio_num);
-    }
 
     gpio_config_t idle_conf = {
         .pin_bit_mask = 1ULL << gpio_num,
@@ -525,7 +612,6 @@ static void ws2812b_gpio_probe(gpio_num_t gpio_num)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&idle_conf);
-    printf("WS2812B_PROBE done: if readback changed but LED stays dark, check DIN direction, GND, 5V, or 3.3V data level compatibility\n");
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -637,17 +723,10 @@ void app_main(void)
     }
     led_group_init(&pins);
     servo_init(&pins);
-    printf("WS2812B wiring expected: ESP32-S3 GPIO%d -> WS2812B DIN, VDD -> 5V, GND common\n", WS2812B_GPIO);
-    printf("WS2812B warning: GPIO%d also maps to LCD_B7 / OV_D2 on this board\n", WS2812B_GPIO);
     ws2812b_gpio_probe(WS2812B_GPIO);
     esp_err_t ws2812_ret = ws2812b_init(WS2812B_GPIO, WS2812B_LED_COUNT);
-    if (ws2812_ret != ESP_OK) {
-        printf("WS2812B init on GPIO%d failed: %s\n", WS2812B_GPIO, esp_err_to_name(ws2812_ret));
-    } else {
-        printf("WS2812B ready on GPIO%d, LED count=%d\n", WS2812B_GPIO, WS2812B_LED_COUNT);
-        printf("NOTE: GPIO6 is also routed as LCD_B7 / OV_D2 on this board; do not use RGB LCD or camera on the same IO at the same time.\n");
-        esp_err_t fill_ret = ws2812b_fill(0, WS2812B_TEST_BRIGHTNESS, 0);
-        printf("WS2812B_TEST initial green send ret=%s\n", esp_err_to_name(fill_ret));
+    if (ws2812_ret == ESP_OK) {
+        ws2812b_fill(0, WS2812B_TEST_BRIGHTNESS, 0);
     }
 
     int angle_s3 = 0;
@@ -699,14 +778,15 @@ void app_main(void)
             printf("VOICE: KEY2 level changed: %d -> %d\n", last_key2_log, cur2);
             last_key2_log = cur2;
         }
+        if (last_key2 == 1 && cur2 == 0) {
+            printf("VOICE: KEY2 falling edge (only stops upload while recording)\n");
+        }
         last_key2 = cur2;
 
         if (ws2812_ret == ESP_OK &&
             xTaskGetTickCount() - last_ws2812_tick >= pdMS_TO_TICKS(500)) {
             const ws2812b_color_t color = ws2812_demo_colors[ws2812_step];
-            esp_err_t fill_ret = ws2812b_fill(color.red, color.green, color.blue);
-            printf("WS2812B_TEST send step=%u RGB=(%u,%u,%u), ret=%s\n",
-                   ws2812_step, color.red, color.green, color.blue, esp_err_to_name(fill_ret));
+            ws2812b_fill(color.red, color.green, color.blue);
             ws2812_step = (ws2812_step + 1) %
                           (sizeof(ws2812_demo_colors) / sizeof(ws2812_demo_colors[0]));
             last_ws2812_tick = xTaskGetTickCount();
