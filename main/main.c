@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_netif.h"
+#include "esp_psram.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
@@ -35,10 +36,12 @@
 #define VOICE_CHAT_URL VOICE_SERVER_BASE_URL "/api/voice/chat"
 #define VOICE_DEVICE_ID "esp32s3-001"
 #define VOICE_SAMPLE_RATE_HZ 16000
-#define VOICE_MAX_RECORD_MS 8000
+#define VOICE_MAX_RECORD_MS 2000
 #define VOICE_RECORD_CHUNK_SAMPLES 512
 #define VOICE_HTTP_TIMEOUT_MS 90000
 #define VOICE_MIN_RECORD_MS 1000
+#define VOICE_MP3_STREAM_BUFFER_SIZE 16384
+#define VOICE_HTTP_READ_CHUNK_SIZE 2048
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
@@ -49,6 +52,31 @@
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
+static volatile bool s_voice_task_running;
+
+static void voice_log_mem(const char *stage)
+{
+    printf("VOICE_MEM[%s]: free_heap=%u largest_internal=%u largest_spiram=%u stack_free=%u\n",
+           stage ? stage : "-",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    audio_io_log_state(stage);
+}
+
+static void *voice_malloc_spiram(size_t size, const char *label)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        printf("VOICE: allocate %s failed (%u bytes), free_heap=%u largest_internal=%u largest_spiram=%u\n",
+               label ? label : "buffer", (unsigned)size,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    return ptr;
+}
 
 static void voice_debug_dump_bytes(const char *label, const uint8_t *data, size_t len)
 {
@@ -136,18 +164,16 @@ static uint8_t *voice_alloc_wav_buffer(size_t *max_samples_out)
 
     while (max_samples >= min_samples) {
         size_t bytes = 44 + max_samples * sizeof(int16_t);
-        uint8_t *wav = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!wav) {
-            wav = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-        }
+        uint8_t *wav = voice_malloc_spiram(bytes, "wav buffer");
         if (wav) {
             *max_samples_out = max_samples;
             return wav;
         }
 
-        printf("VOICE: allocate wav buffer failed (%u bytes), largest 8bit=%u psram=%u\n",
+        printf("VOICE: allocate wav buffer failed (%u bytes), free_heap=%u largest_internal=%u largest_spiram=%u\n",
                (unsigned)bytes,
-               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         max_samples /= 2;
     }
@@ -157,6 +183,7 @@ static uint8_t *voice_alloc_wav_buffer(size_t *max_samples_out)
 
 static uint8_t *voice_record_wav_until_stop(size_t *wav_len)
 {
+    voice_log_mem("record_before");
     size_t max_samples = 0;
     uint8_t *wav = voice_alloc_wav_buffer(&max_samples);
     if (!wav) {
@@ -259,6 +286,7 @@ static char *http_read_text_response(esp_http_client_handle_t client, int max_le
 
 static char *voice_upload_wav(const uint8_t *wav, size_t wav_len)
 {
+    voice_log_mem("upload_before");
     static const char *boundary = "----esp32s3-voice-boundary";
     char head[512];
     char tail[128];
@@ -387,15 +415,17 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
     return n > 0;
 }
 
-static uint8_t *http_download_binary(const char *url, size_t *out_len)
+static esp_err_t voice_stream_mp3_url(const char *url)
 {
+    voice_log_mem("download_before");
     esp_http_client_config_t config = {
         .url = url,
         .timeout_ms = VOICE_HTTP_TIMEOUT_MS,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
-        return NULL;
+        printf("VOICE: GET client init failed\n");
+        return ESP_ERR_NO_MEM;
     }
 
     esp_http_client_set_method(client, HTTP_METHOD_GET);
@@ -403,7 +433,7 @@ static uint8_t *http_download_binary(const char *url, size_t *out_len)
     if (err != ESP_OK) {
         printf("VOICE: GET open failed: %s\n", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        return NULL;
+        return err;
     }
 
     int content_len = esp_http_client_fetch_headers(client);
@@ -412,83 +442,97 @@ static uint8_t *http_download_binary(const char *url, size_t *out_len)
     if (status != 200) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        return NULL;
+        return ESP_FAIL;
     }
 
-    size_t cap = content_len > 0 ? (size_t)content_len : 8192;
-    uint8_t *buf = malloc(cap);
-    if (!buf) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return NULL;
-    }
-
-    size_t total = 0;
-    while (1) {
-        if (total == cap) {
-            size_t new_cap = cap * 2;
-            uint8_t *new_buf = realloc(buf, new_cap);
-            if (!new_buf) {
-                free(buf);
-                esp_http_client_close(client);
-                esp_http_client_cleanup(client);
-                return NULL;
-            }
-            buf = new_buf;
-            cap = new_cap;
-        }
-
-        int ret = esp_http_client_read(client, (char *)buf + total, cap - total);
-        if (ret <= 0) {
-            break;
-        }
-        total += ret;
-        printf("VOICE_DBG: GET read chunk=%d total=%u cap=%u\n",
-               ret, (unsigned)total, (unsigned)cap);
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    *out_len = total;
-    voice_debug_dump_bytes("download body", buf, total);
-    return buf;
-}
-
-static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
-{
-    mp3dec_t dec;
-    mp3dec_init(&dec);
-    voice_debug_dump_bytes("mp3 input", mp3, mp3_len);
-    printf("VOICE_DBG: mp3 playback stack free before=%u\n",
-           (unsigned)uxTaskGetStackHighWaterMark(NULL));
-
+    voice_log_mem("playback_before");
     esp_err_t stream_err = audio_io_playback_begin();
     if (stream_err != ESP_OK) {
         printf("VOICE: playback begin failed: %s\n", esp_err_to_name(stream_err));
-        return;
+        voice_log_mem("playback_begin_failed");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return stream_err;
     }
+
+    mp3dec_t dec;
+    mp3dec_init(&dec);
 
     int16_t *pcm = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
-                                    MALLOC_CAP_8BIT);
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!pcm) {
-        printf("VOICE: allocate mp3 pcm buffer failed (%u bytes), largest 8bit=%u\n",
+        printf("VOICE: allocate mp3 pcm buffer failed (%u bytes), free_heap=%u largest_internal=%u largest_spiram=%u\n",
                (unsigned)(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)),
-               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         audio_io_playback_end();
-        return;
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
     }
 
-    size_t offset = 0;
+    uint8_t *mp3_buf = voice_malloc_spiram(VOICE_MP3_STREAM_BUFFER_SIZE, "mp3 stream buffer");
+    if (!mp3_buf) {
+        free(pcm);
+        audio_io_playback_end();
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool eof = false;
+    size_t have = 0;
+    size_t total_read = 0;
     int frame_index = 0;
-    while (offset < mp3_len) {
-        mp3dec_frame_info_t info = {0};
-        int samples = mp3dec_decode_frame(&dec, mp3 + offset, (int)(mp3_len - offset),
-                                          pcm, &info);
-        if (info.frame_bytes == 0) {
-            offset++;
+    esp_err_t play_err = ESP_OK;
+    while (!eof || have > 0) {
+        while (!eof && have <= VOICE_MP3_STREAM_BUFFER_SIZE - VOICE_HTTP_READ_CHUNK_SIZE) {
+            int ret = esp_http_client_read(client, (char *)mp3_buf + have,
+                                           VOICE_HTTP_READ_CHUNK_SIZE);
+            if (ret < 0) {
+                printf("VOICE: GET read failed ret=%d\n", ret);
+                play_err = ESP_FAIL;
+                eof = true;
+                break;
+            }
+            if (ret == 0) {
+                eof = true;
+                break;
+            }
+            if (total_read == 0) {
+                voice_debug_dump_bytes("mp3 stream first bytes", mp3_buf, (size_t)ret);
+            }
+            have += (size_t)ret;
+            total_read += (size_t)ret;
+            printf("VOICE_DBG: GET stream chunk=%d total=%u buffered=%u\n",
+                   ret, (unsigned)total_read, (unsigned)have);
+        }
+
+        if (have == 0) {
             continue;
         }
-        offset += info.frame_bytes;
+
+        mp3dec_frame_info_t info = {0};
+        int samples = mp3dec_decode_frame(&dec, mp3_buf, (int)have, pcm, &info);
+        if (info.frame_bytes == 0) {
+            if (eof) {
+                break;
+            }
+            if (have == VOICE_MP3_STREAM_BUFFER_SIZE) {
+                memmove(mp3_buf, mp3_buf + 1, have - 1);
+                have--;
+            }
+            continue;
+        }
+
+        size_t used = (size_t)info.frame_bytes;
+        if (used > have) {
+            used = have;
+        }
+        memmove(mp3_buf, mp3_buf + used, have - used);
+        have -= used;
+
         if (samples > 0 && info.hz > 0 && info.channels > 0) {
             if (frame_index == 0) {
                 printf("VOICE_DBG: mp3 first frame bytes=%d samples=%d hz=%d channels=%d layer=%d bitrate=%d\n",
@@ -501,16 +545,23 @@ static void voice_play_mp3(const uint8_t *mp3, size_t mp3_len)
             if (err != ESP_OK) {
                 printf("VOICE: pcm play failed at frame %d: %s\n",
                        frame_index, esp_err_to_name(err));
+                voice_log_mem("playback_failed");
+                play_err = err;
                 break;
             }
             frame_index++;
         }
     }
+    free(mp3_buf);
     free(pcm);
     audio_io_playback_end();
     printf("VOICE_DBG: mp3 playback stack free after=%u\n",
            (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    printf("VOICE: mp3 playback frames=%d bytes=%u\n", frame_index, (unsigned)mp3_len);
+    printf("VOICE: mp3 stream playback frames=%d bytes=%u result=%s\n",
+           frame_index, (unsigned)total_read, esp_err_to_name(play_err));
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return play_err;
 }
 
 static void voice_chat_once(void)
@@ -559,18 +610,23 @@ static void voice_chat_once(void)
 
     char full_url[384];
     snprintf(full_url, sizeof(full_url), "%s%s", VOICE_SERVER_BASE_URL, audio_url);
-    printf("VOICE: downloading reply mp3: %s\n", full_url);
-
-    size_t mp3_len = 0;
-    uint8_t *mp3 = http_download_binary(full_url, &mp3_len);
-    if (!mp3 || mp3_len == 0) {
-        printf("VOICE: mp3 download failed or empty\n");
-        free(mp3);
-        return;
+    printf("VOICE: streaming reply mp3: %s\n", full_url);
+    esp_err_t play_err = voice_stream_mp3_url(full_url);
+    if (play_err != ESP_OK) {
+        printf("VOICE: mp3 stream playback failed: %s\n", esp_err_to_name(play_err));
     }
+}
 
-    voice_play_mp3(mp3, mp3_len);
-    free(mp3);
+static void voice_chat_task(void *arg)
+{
+    (void)arg;
+    printf("VOICE_DBG: voice task started stack_free=%u\n",
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    audio_io_set_playing(false);
+    voice_chat_once();
+    printf("VOICE: ready, press KEY1 again for next recording\n");
+    s_voice_task_running = false;
+    vTaskDelete(NULL);
 }
 
 static void ws2812b_gpio_probe(gpio_num_t gpio_num)
@@ -698,6 +754,15 @@ void app_main(void)
     board_pins_t pins = board_config_get_default();
 
     printf("BanZiXueXi firmware start (ESP32-S3)\n");
+#if CONFIG_SPIRAM
+    size_t psram_size = esp_psram_get_size();
+    printf("Found %uMB PSRAM, SPI RAM enabled, largest_spiram=%u\n",
+           (unsigned)(psram_size / (1024 * 1024)),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#else
+    printf("VOICE: PSRAM is disabled in sdkconfig\n");
+#endif
+    voice_log_mem("boot");
     printf("AUDIO_DBG board pins: MCLK=%d BCLK=%d WS=%d DOUT=%d\n",
            pins.gpio_speaker_mclk, pins.gpio_speaker_bclk,
            pins.gpio_speaker_ws, pins.gpio_speaker_dout);
@@ -756,9 +821,18 @@ void app_main(void)
         }
         if (last_key1 == 1 && cur1 == 0) {
             printf("VOICE: KEY1 falling edge, start voice chat\n");
-            audio_io_set_playing(false);
-            voice_chat_once();
-            printf("VOICE: ready, press KEY1 again for next recording\n");
+            if (s_voice_task_running) {
+                printf("VOICE: voice task already running, ignore KEY1\n");
+            } else {
+                s_voice_task_running = true;
+                BaseType_t ok = xTaskCreatePinnedToCore(voice_chat_task, "voice_chat",
+                                                        12288, NULL, 5, NULL,
+                                                        tskNO_AFFINITY);
+                if (ok != pdPASS) {
+                    s_voice_task_running = false;
+                    printf("VOICE: create voice task failed\n");
+                }
+            }
         }
         last_key1 = cur1;
 

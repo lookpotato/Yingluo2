@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "driver/i2s_std.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -20,6 +21,10 @@ static const char *TAG = "audio_io";
 #define VOICE_AMPLITUDE      15000
 #define VOICE_CLIP_FRAMES    (AUDIO_SAMPLE_RATE_HZ * 6 / 5)
 #define FRAMES_PER_WRITE     256
+#define I2S_DMA_DESC_NUM     12
+#define I2S_DMA_FRAME_NUM    256
+#define I2S_BG_WRITE_TIMEOUT_MS 200
+#define I2S_STREAM_WRITE_TIMEOUT_MS 3000
 #define PHASE_INC(hz)        ((uint32_t)(((uint64_t)(hz) << 32) / AUDIO_SAMPLE_RATE_HZ))
 
 static i2c_obj_t *s_i2c;
@@ -29,9 +34,27 @@ static SemaphoreHandle_t s_tx_mutex;
 static volatile bool s_playing;
 static volatile bool s_ready;
 static volatile bool s_mic_ready;
+static volatile bool s_tx_enabled;
+static volatile uint32_t s_stream_write_count;
+static volatile size_t s_stream_last_written;
 static volatile uint32_t s_play_cmd_count;
 static bool s_stream_old_playing;
 static bool s_stream_active;
+
+void audio_io_log_state(const char *tag)
+{
+    ESP_LOGI(TAG,
+             "AUDIO_STATE[%s]: ready=%d mic=%d tx=%p rx=%p tx_enabled=%d playing=%d stream=%d "
+             "stream_writes=%u last_written=%u stack=%u heap_free=%u largest_internal=%u largest_spiram=%u",
+             tag ? tag : "-",
+             s_ready, s_mic_ready, (void *)s_tx, (void *)s_rx, s_tx_enabled,
+             s_playing, s_stream_active, (unsigned)s_stream_write_count,
+             (unsigned)s_stream_last_written,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
 
 static int32_t voice_envelope_q15(uint32_t clip_frame)
 {
@@ -133,6 +156,11 @@ static void audio_task(void *arg)
              FRAMES_PER_WRITE, (int)sizeof(buf));
 
     for (;;) {
+        if (s_stream_active) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
         bool play = s_playing;
         if (play != last_play) {
             ESP_LOGI(TAG, "AUDIO_DBG task sees play=%d ready=%d tx=%p",
@@ -155,11 +183,15 @@ static void audio_task(void *arg)
         }
 
         size_t written = 0;
-        esp_err_t e = i2s_channel_write(s_tx, buf, sizeof(buf), &written, portMAX_DELAY);
+        esp_err_t e = i2s_channel_write(s_tx, buf, sizeof(buf), &written,
+                                        pdMS_TO_TICKS(I2S_BG_WRITE_TIMEOUT_MS));
         xSemaphoreGive(s_tx_mutex);
         if (e != ESP_OK) {
-            ESP_LOGW(TAG, "AUDIO_DBG i2s_channel_write err=%s play=%d requested=%d written=%u",
-                     esp_err_to_name(e), play, (int)sizeof(buf), (unsigned)written);
+            ESP_LOGW(TAG,
+                     "AUDIO_DBG bg i2s_channel_write err=%s play=%d requested=%d written=%u "
+                     "tx_enabled=%d stream=%d",
+                     esp_err_to_name(e), play, (int)sizeof(buf), (unsigned)written,
+                     s_tx_enabled, s_stream_active);
             continue;
         }
 
@@ -211,12 +243,17 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
     }
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    ESP_LOGI(TAG, "AUDIO_DBG creating I2S channels: port=I2S_NUM_0 role=master");
+    chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
+    ESP_LOGI(TAG, "AUDIO_DBG creating I2S channels: port=I2S_NUM_0 role=master dma_desc=%d dma_frame=%d",
+             I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM);
     err = i2s_new_channel(&chan_cfg, &s_tx, &s_rx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel: %s", esp_err_to_name(err));
         return err;
     }
+    ESP_LOGI(TAG, "AUDIO_DBG DMA alloc/channel create OK tx=%p rx=%p desc=%d frame=%d",
+             (void *)s_tx, (void *)s_rx, I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM);
     ESP_LOGI(TAG, "AUDIO_DBG i2s_new_channel OK tx=%p", (void *)s_tx);
 
     i2s_std_config_t std_cfg = {
@@ -254,11 +291,13 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         s_ready = false;
         return err;
     }
+    s_tx_enabled = true;
     ESP_LOGI(TAG, "AUDIO_DBG i2s_channel_enable OK");
     err = i2s_channel_init_std_mode(s_rx, &std_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mic i2s_channel_init_std_mode: %s", esp_err_to_name(err));
         i2s_channel_disable(s_tx);
+        s_tx_enabled = false;
         i2s_del_channel(s_tx);
         s_tx = NULL;
         i2s_del_channel(s_rx);
@@ -272,6 +311,7 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mic i2s_channel_enable: %s", esp_err_to_name(err));
         i2s_channel_disable(s_tx);
+        s_tx_enabled = false;
         i2s_del_channel(s_tx);
         s_tx = NULL;
         i2s_del_channel(s_rx);
@@ -291,10 +331,11 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c)
         ESP_LOGI(TAG, "AUDIO_DBG initial mute result=%s", esp_err_to_name(mute_err));
     }
 
-    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "audio_io", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+    BaseType_t ok = xTaskCreatePinnedToCore(audio_task, "audio_io", 8192, NULL, 5, NULL, tskNO_AFFINITY);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Create audio task failed");
         i2s_channel_disable(s_tx);
+        s_tx_enabled = false;
         i2s_del_channel(s_tx);
         s_tx = NULL;
         s_ready = false;
@@ -439,6 +480,10 @@ esp_err_t audio_io_playback_begin(void)
 
     s_stream_old_playing = s_playing;
     s_playing = false;
+    s_stream_active = true;
+    s_stream_write_count = 0;
+    s_stream_last_written = 0;
+    audio_io_log_state("playback_begin_before_mutex");
 
     uint16_t io_state = xl9555_pin_write(SPK_EN_IO, 0);
     ESP_LOGI(TAG, "PCM stream playback start: SPK_EN state=0x%04x", io_state);
@@ -446,7 +491,8 @@ esp_err_t audio_io_playback_begin(void)
         es8388_hw_mute(s_i2c, false);
     }
 
-    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        s_stream_active = false;
         if (s_i2c) {
             es8388_hw_mute(s_i2c, !s_stream_old_playing);
         }
@@ -454,10 +500,11 @@ esp_err_t audio_io_playback_begin(void)
             xl9555_pin_write(SPK_EN_IO, 1);
         }
         s_playing = s_stream_old_playing;
+        audio_io_log_state("playback_begin_mutex_timeout");
         return ESP_ERR_TIMEOUT;
     }
 
-    s_stream_active = true;
+    audio_io_log_state("playback_begin_ready");
     return ESP_OK;
 }
 
@@ -506,10 +553,23 @@ esp_err_t audio_io_playback_write_pcm(const int16_t *pcm, size_t frame_count,
 
         size_t written = 0;
         ret = i2s_channel_write(s_tx, out, todo * 2 * sizeof(int16_t),
-                                &written, pdMS_TO_TICKS(1000));
+                                &written, pdMS_TO_TICKS(I2S_STREAM_WRITE_TIMEOUT_MS));
+        s_stream_write_count++;
+        s_stream_last_written = written;
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "PCM playback write failed: %s", esp_err_to_name(ret));
+            ESP_LOGW(TAG,
+                     "PCM playback write failed: %s requested=%u written=%u tx_enabled=%d "
+                     "stream=%d write_count=%u",
+                     esp_err_to_name(ret), (unsigned)(todo * 2 * sizeof(int16_t)),
+                     (unsigned)written, s_tx_enabled, s_stream_active,
+                     (unsigned)s_stream_write_count);
+            audio_io_log_state("playback_write_failed");
             break;
+        }
+        if (written != todo * 2 * sizeof(int16_t)) {
+            ESP_LOGW(TAG, "PCM playback short write requested=%u written=%u tx_enabled=%d",
+                     (unsigned)(todo * 2 * sizeof(int16_t)), (unsigned)written,
+                     s_tx_enabled);
         }
         out_pos += todo;
     }
@@ -533,6 +593,7 @@ void audio_io_playback_end(void)
         xl9555_pin_write(SPK_EN_IO, 1);
     }
     s_playing = s_stream_old_playing;
+    audio_io_log_state("playback_end");
     ESP_LOGI(TAG, "PCM stream playback done");
 }
 

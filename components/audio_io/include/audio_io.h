@@ -15,6 +15,7 @@ esp_err_t audio_io_init(const board_pins_t *pins, i2c_obj_t *i2c);
 void audio_io_set_playing(bool play);
 bool audio_io_is_ready(void);
 bool audio_io_mic_is_ready(void);
+void audio_io_log_state(const char *tag);
 esp_err_t audio_io_read_mic_mono16(int16_t *samples, size_t sample_count,
                                    size_t *samples_read, TickType_t timeout_ticks);
 esp_err_t mic_init(void);
