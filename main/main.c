@@ -14,6 +14,7 @@
 #include "esp_netif.h"
 #include "esp_psram.h"
 #include "esp_wifi.h"
+#include "esp_websocket_client.h"
 #include "nvs_flash.h"
 
 #define MINIMP3_IMPLEMENTATION
@@ -27,24 +28,35 @@
 #include "servo.h"
 #include "ws2812b.h"
 #include "xl9555.h"
+#include "esp_log.h"
 
 #define WIFI_STA_SSID "ChinaNet-S1z8"
 #define WIFI_STA_PASSWORD "2g7g2j28"
 #define WIFI_MAXIMUM_RETRY 20
 
 #define VOICE_SERVER_BASE_URL "http://101.34.244.21:8000"
-#define VOICE_CHAT_URL VOICE_SERVER_BASE_URL "/api/voice/chat"
 #define VOICE_DEVICE_ID "esp32s3-001"
+#define VOICE_CHAT_URL VOICE_SERVER_BASE_URL "/api/voice/chat"
+#define VOICE_WS_URL "ws://101.34.244.21:8000/ws/voice?device_id=" VOICE_DEVICE_ID "&sample_rate=16000"
 #define VOICE_SAMPLE_RATE_HZ 16000
 #define VOICE_MAX_RECORD_MS 2000
 #define VOICE_RECORD_CHUNK_SAMPLES 512
 #define VOICE_HTTP_TIMEOUT_MS 90000
+#define VOICE_WS_CONNECT_TIMEOUT_MS 10000
+#define VOICE_WS_RESPONSE_TIMEOUT_MS 90000
 #define VOICE_MIN_RECORD_MS 1000
+#define VOICE_MIN_STREAM_MS 200
 #define VOICE_MP3_STREAM_BUFFER_SIZE 16384
 #define VOICE_HTTP_READ_CHUNK_SIZE 2048
+#define VOICE_END_OF_UTTERANCE "__END_OF_UTTERANCE__"
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
+
+#define VOICE_WS_CONNECTED_BIT BIT0
+#define VOICE_WS_RESPONSE_BIT BIT1
+#define VOICE_WS_DISCONNECTED_BIT BIT2
+#define VOICE_WS_ERROR_BIT BIT3
 
 #define WS2812B_GPIO GPIO_NUM_6
 #define WS2812B_LED_COUNT 1
@@ -53,7 +65,15 @@
 static EventGroupHandle_t s_wifi_event_group;
 static int s_wifi_retry_num;
 static volatile bool s_voice_task_running;
+static const char *TAG = "VOICE";
 
+typedef struct {
+    EventGroupHandle_t events;
+    char *response;
+    size_t response_len;
+    size_t response_cap;
+    bool response_overflow;
+} voice_ws_ctx_t;
 static void voice_log_mem(const char *stage)
 {
     printf("VOICE_MEM[%s]: free_heap=%u largest_internal=%u largest_spiram=%u stack_free=%u\n",
@@ -415,6 +435,237 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
     return n > 0;
 }
 
+static void voice_ws_event_handler(void *handler_args, esp_event_base_t base,
+                                   int32_t event_id, void *event_data)
+{
+    (void)base;
+    voice_ws_ctx_t *ctx = (voice_ws_ctx_t *)handler_args;
+    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+
+    if (!ctx || !ctx->events) {
+        return;
+    }
+
+    switch (event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        printf("VOICE_WS: connected\n");
+        xEventGroupSetBits(ctx->events, VOICE_WS_CONNECTED_BIT);
+        break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+        printf("VOICE_WS: disconnected\n");
+        xEventGroupSetBits(ctx->events, VOICE_WS_DISCONNECTED_BIT);
+        break;
+    case WEBSOCKET_EVENT_ERROR:
+        printf("VOICE_WS: error\n");
+        xEventGroupSetBits(ctx->events, VOICE_WS_ERROR_BIT);
+        break;
+    case WEBSOCKET_EVENT_DATA:
+        if (!data || !data->data_ptr || data->data_len <= 0) {
+            break;
+        }
+        printf("VOICE_WS: data len=%d payload_len=%d offset=%d op=%d\n",
+               data->data_len, data->payload_len, data->payload_offset, data->op_code);
+        if (ctx->response && ctx->response_cap > 0) {
+            if (data->payload_offset == 0) {
+                ctx->response_len = 0;
+                ctx->response_overflow = false;
+            }
+
+            size_t room = ctx->response_cap - ctx->response_len - 1;
+            size_t copy_len = (size_t)data->data_len;
+            if (copy_len > room) {
+                copy_len = room;
+                ctx->response_overflow = true;
+            }
+            if (copy_len > 0) {
+                memcpy(ctx->response + ctx->response_len, data->data_ptr, copy_len);
+                ctx->response_len += copy_len;
+                ctx->response[ctx->response_len] = '\0';
+            }
+
+            if (data->payload_len <= data->payload_offset + data->data_len) {
+                xEventGroupSetBits(ctx->events, VOICE_WS_RESPONSE_BIT);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static int voice_ws_send_all_bin(esp_websocket_client_handle_t client,
+                                 const uint8_t *data, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        int chunk_len = (int)(len - sent);
+        int ret = esp_websocket_client_send_bin(client, (const char *)data + sent,
+                                                chunk_len, pdMS_TO_TICKS(3000));
+        if (ret <= 0) {
+            return ret;
+        }
+        sent += (size_t)ret;
+    }
+    return (int)sent;
+}
+
+static char *voice_stream_pcm_websocket(void)
+{
+    voice_log_mem("ws_before");
+    char *response = calloc(1, 4096);
+    if (!response) {
+        printf("VOICE_WS: allocate response buffer failed\n");
+        return NULL;
+    }
+
+    EventGroupHandle_t events = xEventGroupCreate();
+    if (!events) {
+        printf("VOICE_WS: create event group failed\n");
+        free(response);
+        return NULL;
+    }
+
+    voice_ws_ctx_t ctx = {
+        .events = events,
+        .response = response,
+        .response_cap = 4096,
+    };
+    esp_websocket_client_config_t config = {
+        .uri = VOICE_WS_URL,
+        .network_timeout_ms = VOICE_HTTP_TIMEOUT_MS,
+    };
+    esp_websocket_client_handle_t client = esp_websocket_client_init(&config);
+    if (!client) {
+        printf("VOICE_WS: client init failed\n");
+        vEventGroupDelete(events);
+        free(response);
+        return NULL;
+    }
+
+    esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
+                                                  voice_ws_event_handler, &ctx);
+    if (err != ESP_OK) {
+        printf("VOICE_WS: register events failed: %s\n", esp_err_to_name(err));
+        esp_websocket_client_destroy(client);
+        vEventGroupDelete(events);
+        free(response);
+        return NULL;
+    }
+
+    printf("VOICE_WS: connecting %s\n", VOICE_WS_URL);
+    err = esp_websocket_client_start(client);
+    if (err != ESP_OK) {
+        printf("VOICE_WS: start failed: %s\n", esp_err_to_name(err));
+        esp_websocket_client_destroy(client);
+        vEventGroupDelete(events);
+        free(response);
+        return NULL;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(events,
+                                           VOICE_WS_CONNECTED_BIT | VOICE_WS_ERROR_BIT |
+                                           VOICE_WS_DISCONNECTED_BIT,
+                                           pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(VOICE_WS_CONNECT_TIMEOUT_MS));
+    if (!(bits & VOICE_WS_CONNECTED_BIT)) {
+        printf("VOICE_WS: connect timeout/fail bits=0x%x\n", (unsigned)bits);
+        esp_websocket_client_stop(client);
+        esp_websocket_client_destroy(client);
+        vEventGroupDelete(events);
+        free(response);
+        return NULL;
+    }
+
+    int16_t pcm[VOICE_RECORD_CHUNK_SAMPLES];
+    size_t total_samples = 0;
+    size_t last_debug_sample_count = 0;
+    int last_stop = KEY2;
+    TickType_t start = xTaskGetTickCount();
+    printf("VOICE_WS: streaming PCM started, press KEY2 to end utterance\n");
+
+    while (1) {
+        EventBits_t state = xEventGroupGetBits(events);
+        if (state & (VOICE_WS_DISCONNECTED_BIT | VOICE_WS_ERROR_BIT)) {
+            printf("VOICE_WS: stop recording because websocket state=0x%x\n", (unsigned)state);
+            break;
+        }
+
+        size_t got = 0;
+        err = audio_io_read_mic_mono16(pcm, VOICE_RECORD_CHUNK_SAMPLES, &got,
+                                       pdMS_TO_TICKS(1000));
+        if (err != ESP_OK) {
+            printf("VOICE_WS: mic read failed: %s\n", esp_err_to_name(err));
+            break;
+        }
+        if (got > 0) {
+            int ret = voice_ws_send_all_bin(client, (const uint8_t *)pcm,
+                                            got * sizeof(int16_t));
+            if (ret <= 0) {
+                printf("VOICE_WS: send PCM failed ret=%d\n", ret);
+                break;
+            }
+            total_samples += got;
+            if (total_samples - last_debug_sample_count >= VOICE_SAMPLE_RATE_HZ) {
+                voice_debug_pcm_stats(pcm, got, total_samples);
+                last_debug_sample_count = total_samples;
+            }
+        }
+
+        int cur_stop = KEY2;
+        if (last_stop == 1 && cur_stop == 0) {
+            printf("VOICE_WS: KEY2 pressed, ending utterance\n");
+            break;
+        }
+        last_stop = cur_stop;
+    }
+
+    uint32_t duration_ms = (uint32_t)((xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
+    printf("VOICE_WS: PCM stream finished, samples=%u duration=%u ms\n",
+           (unsigned)total_samples, (unsigned)duration_ms);
+
+    if (duration_ms < VOICE_MIN_STREAM_MS) {
+        printf("VOICE_WS: stream is very short (%u ms), still sending end marker\n",
+               (unsigned)duration_ms);
+    }
+
+    int end_ret = esp_websocket_client_send_text(client, VOICE_END_OF_UTTERANCE,
+                                                 strlen(VOICE_END_OF_UTTERANCE),
+                                                 pdMS_TO_TICKS(3000));
+    if (end_ret <= 0) {
+        printf("VOICE_WS: send end marker failed ret=%d\n", end_ret);
+        esp_websocket_client_stop(client);
+        esp_websocket_client_destroy(client);
+        vEventGroupDelete(events);
+        free(response);
+        return NULL;
+    }
+    printf("VOICE_WS: end marker sent, waiting for final_text/reply\n");
+
+    bits = xEventGroupWaitBits(events,
+                               VOICE_WS_RESPONSE_BIT | VOICE_WS_ERROR_BIT |
+                               VOICE_WS_DISCONNECTED_BIT,
+                               pdFALSE, pdFALSE,
+                               pdMS_TO_TICKS(VOICE_WS_RESPONSE_TIMEOUT_MS));
+
+    char *result = NULL;
+    if (bits & VOICE_WS_RESPONSE_BIT) {
+        if (ctx.response_overflow) {
+            printf("VOICE_WS: response truncated at %u bytes\n", (unsigned)ctx.response_len);
+        }
+        printf("VOICE_WS: response=%s\n", response);
+        result = response;
+        response = NULL;
+    } else {
+        printf("VOICE_WS: no response before timeout/disconnect bits=0x%x\n", (unsigned)bits);
+    }
+
+    esp_websocket_client_stop(client);
+    esp_websocket_client_destroy(client);
+    vEventGroupDelete(events);
+    free(response);
+    return result;
+}
+
 static esp_err_t voice_stream_mp3_url(const char *url)
 {
     voice_log_mem("download_before");
@@ -458,8 +709,15 @@ static esp_err_t voice_stream_mp3_url(const char *url)
     mp3dec_t dec;
     mp3dec_init(&dec);
 
-    int16_t *pcm = heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+int16_t *pcm = heap_caps_malloc(
+    MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t),
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+);
+
+printf(
+    "MINIMP3_MAX_SAMPLES_PER_FRAME=%d\n",
+    MINIMP3_MAX_SAMPLES_PER_FRAME
+);
     if (!pcm) {
         printf("VOICE: allocate mp3 pcm buffer failed (%u bytes), free_heap=%u largest_internal=%u largest_spiram=%u\n",
                (unsigned)(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)),
@@ -515,6 +773,13 @@ static esp_err_t voice_stream_mp3_url(const char *url)
 
         mp3dec_frame_info_t info = {0};
         int samples = mp3dec_decode_frame(&dec, mp3_buf, (int)have, pcm, &info);
+        
+        ESP_LOGI(TAG,
+         "MP3 decoded: frame_bytes=%d samples=%d channels=%d hz=%d",
+         info.frame_bytes,
+         samples,
+         info.channels,
+         info.hz);
         if (info.frame_bytes == 0) {
             if (eof) {
                 break;
@@ -570,44 +835,36 @@ static void voice_chat_once(void)
         printf("VOICE: mic is not ready, cannot record\n");
         return;
     }
-    if (!audio_io_is_ready()) {
-        printf("VOICE: speaker is not ready, cannot play reply\n");
-        return;
-    }
 
-    size_t wav_len = 0;
-    uint8_t *wav = voice_record_wav_until_stop(&wav_len);
-    if (!wav) {
-        return;
-    }
-
-    printf("VOICE: uploading wav, bytes=%u\n", (unsigned)wav_len);
-    char *json = voice_upload_wav(wav, wav_len);
-    free(wav);
+    char *json = voice_stream_pcm_websocket();
     if (!json) {
         return;
     }
 
-    printf("VOICE: response=%s\n", json);
-    if (!json_ok_true(json)) {
-        printf("VOICE: server ok is not true, skip playback\n");
-        free(json);
-        return;
+    char final_text[512];
+    if (json_get_string(json, "final_text", final_text, sizeof(final_text))) {
+        printf("VOICE: final_text=%s\n", final_text);
     }
 
-    char reply_text[512];
-    if (json_get_string(json, "reply_text", reply_text, sizeof(reply_text))) {
-        printf("VOICE: reply_text=%s\n", reply_text);
+    char reply[512];
+    if (json_get_string(json, "reply", reply, sizeof(reply))) {
+        printf("VOICE: reply=%s\n", reply);
+    } else if (json_get_string(json, "reply_text", reply, sizeof(reply))) {
+        printf("VOICE: reply_text=%s\n", reply);
     }
 
     char audio_url[256];
     if (!json_get_string(json, "audio_url", audio_url, sizeof(audio_url))) {
-        printf("VOICE: audio_url missing, skip playback\n");
+        printf("VOICE: audio_url missing, response handled as text only\n");
         free(json);
         return;
     }
     free(json);
 
+    if (!audio_io_is_ready()) {
+        printf("VOICE: speaker is not ready, skip audio_url playback\n");
+        return;
+    }
     char full_url[384];
     snprintf(full_url, sizeof(full_url), "%s%s", VOICE_SERVER_BASE_URL, audio_url);
     printf("VOICE: streaming reply mp3: %s\n", full_url);
@@ -826,7 +1083,7 @@ void app_main(void)
             } else {
                 s_voice_task_running = true;
                 BaseType_t ok = xTaskCreatePinnedToCore(voice_chat_task, "voice_chat",
-                                                        12288, NULL, 5, NULL,
+                                                        32768, NULL, 5, NULL,
                                                         tskNO_AFFINITY);
                 if (ok != pdPASS) {
                     s_voice_task_running = false;
